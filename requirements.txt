@@ -1,0 +1,39 @@
+##############################################
+# Torch (CUDA 12.1)
+##############################################
+# torch==2.5.1+cu121
+# torchvision==0.20.1+cu121
+# torchaudio==2.5.1+cu121
+# --extra-index-url https://download.pytorch.org/whl/cu121
+
+##############################################
+# Ultralytics YOLO dependencies
+##############################################
+ultralytics>=8.1.0          # required for YOLO()
+numpy>=1.23                 # used everywhere
+opencv-python-headless>=4.8 # safe for servers / no GUI issues
+Pillow>=10.0.0              # ensures YOLO & cv2 compatibility
+PyYAML>=6.0
+tqdm>=4.64.0
+typing-extensions>=4.0
+
+##############################################
+# FastAPI, Web, HTTP
+##############################################
+fastapi
+uvicorn[standard]
+websockets
+httpx
+python-multipart
+
+##############################################
+# Cloud / Database Clients
+##############################################
+psycopg2-binary==2.9.9
+boto3==1.34.90
+botocore==1.34.90
+
+##############################################
+# Dev tools
+##############################################
+flake8

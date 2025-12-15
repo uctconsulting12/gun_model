@@ -1,0 +1,48 @@
+name: Deploy to EC2 (Build on EC2)
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy on EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ubuntu
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+           
+            echo "---- Pulling latest code ----"
+
+            # Clone or update repo in ~/gun_model
+            if [ ! -d ~/gun_model ]; then
+              git clone https://github.com/uctconsulting12/gun_model.git ~/gun_model
+            else
+              cd ~/gun_model
+              git pull origin main
+            fi
+
+            echo "---- Building Docker image ----"
+            cd ~/gun_model
+            sudo docker build -t gun_image .
+            echo "--- remove none images ------"
+            sudo docker image prune -f
+
+            echo "---- Stopping old container ----"
+            sudo docker stop gun_container || true
+            sudo docker rm gun_container || true
+
+            echo "---- Running new container with AWS creds ----"
+            sudo docker run -d \
+            --name gun_container \
+            -p 8004:8004 \
+            --gpus all \
+            -v /home/ubuntu/.aws:/root/.aws \
+            gun_image
+
+            echo "Deployment completed. "

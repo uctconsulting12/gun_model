@@ -1,0 +1,15 @@
+
+test_videos
+__pycache__
+__pycache__/app.cpython-312.pyc
+__pycache__/main.cpython-312.pyc
+gvenv
+sample_videos
+research
+out_gun_wrist_intersection_with_size.mp4
+vidw3.mp4
+main.py
+handler
+datasets
+yolov8x-pose.pt
+gun_dd_f_best.pt
