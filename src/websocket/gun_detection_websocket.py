@@ -137,7 +137,7 @@ def run_gun_detection_detection(client_id: str, video_url: str, camera_id: int, 
 
                 #------------------ STORE EVERY 20th FRAME -----------------
                 annotated_frame=result.get('annotated_frame')
-                if result["message"]:
+                if result["message"]!= "✅ No guns detected near wrist regions":
 
                     if annotated_frame is not None:
                         # JSON COPY to avoid race condition
