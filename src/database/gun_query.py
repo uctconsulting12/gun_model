@@ -36,15 +36,12 @@ logger = logging.getLogger("detection")
 
 def insert_data(d, s3_url):
     """
-    Insert gun detection data into shop_lifting table
-    STRICTLY follows the given response structure
+    Insert gun detection data into gun_detections table
+    STRICTLY follows the latest response structure
     """
 
     conn = None
     try:
-        # STRICT: extract detections object
-        
-
         conn = pool.getconn()
         cursor = conn.cursor()
 
@@ -53,19 +50,19 @@ def insert_data(d, s3_url):
                 cam_id,
                 org_id,
                 user_id,
-                frame_id,
-                timestamp,
                 persons,
                 guns,
-                message,
+                gun_holders,
                 s3_url,
-                status
+                status,
+                timestamp
             )
             VALUES (
-                %s, %s, %s, %s, %s,
+                %s, %s, %s,
                 %s::jsonb,
                 %s::jsonb,
-                %s, %s, %s
+                %s::jsonb,
+                %s, %s,%s
             )
             RETURNING id;
         """
@@ -73,19 +70,15 @@ def insert_data(d, s3_url):
         cursor.execute(
             insert_query,
             (
-                d["cam_id"],               # int
-                d["org_id"],               # int
-                d["user_id"],              # int
-                d["frame_id"],             # text
-                d["timestamp"],            # timestamptz
-
-                json.dumps([]),             # persons → empty (NOT in response)
-
-                json.dumps(d["guns"]),      # FULL guns array EXACTLY as received
-
-                d["message"],               # text
-                s3_url,                     # text
-                d["status"]                 # int
+                d["cam_id"],                       # int
+                d["org_id"],                       # int
+                d["user_id"],                      # int
+                json.dumps(d["persons_present"]),  # jsonb
+                json.dumps(d["guns"]),             # jsonb
+                json.dumps(d["gun_holders"]),      # jsonb
+                s3_url,                            # text
+                d["status"] ,
+                d["time_stamp"]
             )
         )
 
@@ -93,7 +86,9 @@ def insert_data(d, s3_url):
         conn.commit()
         cursor.close()
 
-        logger.info(f"✅ Gun detection inserted | frame_id={d['frame_id']} | id={inserted_id}")
+        logger.info(
+            f"✅ Gun detection inserted | cam_id={d['cam_id']} | id={inserted_id}"
+        )
         return True
 
     except Exception as e:
@@ -105,8 +100,3 @@ def insert_data(d, s3_url):
     finally:
         if conn:
             pool.putconn(conn)
-
-
-
-
-
