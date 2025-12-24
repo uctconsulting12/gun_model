@@ -50,3 +50,13 @@ botocore==1.34.90
 # Dev / Debug Tools
 ##############################################
 flake8>=7.0
+
+
+ultralytics>=8.0.0
+torch>=1.12
+torchvision>=0.13
+opencv-python>=4.6
+numpy>=1.21
+scipy>=1.7
+deep-sort-realtime>=1.3.2
+torchreid>=1.4.0
