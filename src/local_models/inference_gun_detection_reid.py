@@ -2,7 +2,7 @@
 inference_gun_detection_reid.py
 
 Real-time gun detection pipeline:
-  - TensorRT yolo11n-pose  → person/pose detection  (fastest nano model)
+  - TensorRT yolo11m-pose  → person/pose detection  (medium model, better keypoints)
   - TensorRT best          → gun detection (YOLOv8n fine-tuned, ~6MB)
   - Pose + gun inference run IN PARALLEL via ThreadPoolExecutor
   - non_weapons.pt removed entirely (no cross-verification step)
@@ -60,18 +60,48 @@ DEFAULTS: Dict[str, Any] = {
     # Run convert_to_tensorrt.py once to generate the .engine files.
     "GUN_MODELS": [
         {
-            "path":            _model_path("best.engine"),   # TRT preferred
-            "fallback_path":   _model_path("best.pt"),       # .pt fallback
-            "weight":          1.0,
-            "conf":            0.35,
-            "name":            "gun-primary",
-            "target_class_id": 0,
+            "path":          _model_path("best.engine"),   # TRT preferred
+            "fallback_path": _model_path("best.pt"),       # .pt fallback
+            "weight":        1.0,
+            "conf":          0.45,
+            "name":          "gun-primary",
+            # None = accept ALL classes (IGNORED_CLASS_IDS filter applied separately).
+            # Current model: YOLO26x, 7 classes:
+            #   0:Blunt_Weapon, 1:Explosive, 2:Fire_Smoke,
+            #   3:Firearm, 4:Melee_Weapon, 5:Person, 6:Tool
+            # Person(5), Fire_Smoke(2), Tool(6) are stripped via IGNORED_CLASS_IDS.
+            "target_class_ids": None,
         },
     ],
 
-    # Pose model — nano TRT for maximum speed
-    "POSE_MODEL_PATH":          _model_path("yolo11n-pose.engine"),
-    "POSE_MODEL_FALLBACK_PATH": _model_path("yolo11n-pose.pt"),
+    # Human-readable names for each class ID in the gun model.
+    # Current model: YOLO26x — 7-class weapon detection
+    # {0: 'Blunt_Weapon', 1: 'Explosive', 2: 'Fire_Smoke',
+    #  3: 'Firearm', 4: 'Melee_Weapon', 5: 'Person', 6: 'Tool'}
+    "WEAPON_CLASS_NAMES": {
+        0: "Blunt Weapon",
+        1: "Explosive",
+        2: "Fire/Smoke",
+        3: "Firearm",
+        4: "Melee Weapon",
+        5: "Person",
+        6: "Tool",
+    },
+
+    # Classes that trigger the ARMED alert and purple box on the holder.
+    # Firearms (3) and Explosives (1) are the primary threat classes.
+    # Blunt weapons (0) and Melee (4) trigger a lower-severity alert.
+    "FIREARM_CLASS_IDS": {1, 3},    # Explosive, Firearm — highest threat
+    "MELEE_CLASS_IDS":   {0, 4},    # Blunt_Weapon, Melee_Weapon
+
+    # Classes to silently IGNORE — never draw box or raise alert.
+    # Person(5): handled by pose model; Tool(6): not a threat;
+    # Fire_Smoke(2): environmental, not a person-held weapon.
+    "IGNORED_CLASS_IDS": {2, 5, 6},  # Fire_Smoke, Person, Tool
+
+    # Pose model — medium TRT for better keypoint accuracy
+    "POSE_MODEL_PATH":          _model_path("yolo11m-pose.engine"),
+    "POSE_MODEL_FALLBACK_PATH": _model_path("yolo11m-pose.pt"),
     "CONF_THR_POSE":   0.40,
     "CONF_THR_WRIST":  0.20,
 
@@ -80,12 +110,13 @@ DEFAULTS: Dict[str, Any] = {
     "AGREEMENT_BONUS":            0.20,
     "FINAL_CONFIDENCE_THRESHOLD": 0.50,
 
-    # Gun size filter
-    "GUN_MIN_AREA":          300,
-    "GUN_MAX_FRAME_FRACTION":0.07,
-    "GUN_MAX_WIDTH":         320,
-    "GUN_MAX_HEIGHT":        260,
-    "GUN_MAX_ASPECT":        8.0,
+    # Gun size filter — conservative defaults, rejects cars/walls/floors.
+    # Shoulder weapons (snipers, bazookas) can be wider — limits raised slightly.
+    "GUN_MIN_AREA":          200,
+    "GUN_MAX_FRAME_FRACTION":0.10,
+    "GUN_MAX_WIDTH":         420,
+    "GUN_MAX_HEIGHT":        320,
+    "GUN_MAX_ASPECT":        10.0,
 
     # Holder association
     "WRIST_HALF":            40,
@@ -97,7 +128,7 @@ DEFAULTS: Dict[str, Any] = {
     "GUN_TRACKER_MAX_LOST_FRAMES": 8,
 
     # Alert
-    "ALERT_THRESHOLD":               0.60,
+    "ALERT_THRESHOLD":               0.45,
     "ALERT_COOLDOWN_FRAMES":         90,
     "ALERT_ON_FIRST_DETECTION_ONLY": True,
 
@@ -106,16 +137,16 @@ DEFAULTS: Dict[str, Any] = {
     "MIN_PERSON_HEIGHT": 40,
     "MIN_PERSON_AREA":   1000,
 
-    # DeepSort
-    "TRACKER_MAX_AGE":            60,
+    # DeepSort — tuned for re-identification across occlusions
+    "TRACKER_MAX_AGE":            90,    # hold lost tracks for 90 frames (~3s@30fps)
     "TRACKER_N_INIT":              2,
-    "TRACKER_MAX_IOU_DISTANCE":    0.80,
-    "TRACKER_MAX_COSINE_DISTANCE": 0.25,
-    "TRACKER_NN_BUDGET":           200,
+    "TRACKER_MAX_IOU_DISTANCE":    0.70,
+    "TRACKER_MAX_COSINE_DISTANCE": 0.20, # tighter appearance gate = fewer ID swaps
+    "TRACKER_NN_BUDGET":           100,
 
     # Parallel inference thread pool size
-    # 2 workers: pose + gun run concurrently (OSNet disabled)
-    "INFERENCE_WORKERS": 2,
+    # 3 workers: pose + gun + OSNet all run concurrently
+    "INFERENCE_WORKERS": 3,
 
     # Gun detection frame-skip: 1 = disabled (run gun model every frame).
     # Increase to 2 or 3 only if fps is insufficient for your hardware.
@@ -131,9 +162,15 @@ DEFAULTS: Dict[str, Any] = {
     # 480 gives ~30% speedup over 640 with minimal accuracy loss.
     "GUN_INFER_IMGSZ": 480,
 
-    # OSNet ReID — disabled for ~35ms/frame saving.
-    # Set True to re-enable appearance-based person re-identification.
-    "USE_OSNET": False,
+    # OSNet ReID — threat-only embedding with post-marking cooldown.
+    # After a person is added to armed_ids, their ReID is locked for
+    # REID_LOCK_FRAMES frames (no OSNet call). During the lock the existing
+    # gallery embedding is reused, giving the tracker time to stabilise
+    # before any re-identification attempt can accidentally swap IDs.
+    # After the lock expires, OSNet re-embeds them every frame to keep the
+    # gallery fresh for future occlusion recovery.
+    "USE_OSNET":        True,
+    "REID_LOCK_FRAMES": 60,   # 2 s @ 30 fps — frames after marking where ReID is frozen
 
     "VERBOSE": True,
 }
@@ -222,8 +259,12 @@ class GunTracker:
         self._tracks: Dict[int, Dict] = {}
         self._nid = 1
 
-    def update(self, dets: List[Tuple[np.ndarray, float]]
-               ) -> List[Tuple[int, np.ndarray, float]]:
+    def update(self, dets: List[Tuple[np.ndarray, float, int]]
+               ) -> List[Tuple[int, np.ndarray, float, int]]:
+        """
+        dets: list of (bbox, score, class_id)
+        returns: list of (track_id, bbox, score, class_id)
+        """
         for t in self._tracks.values():
             t["lost"] += 1
 
@@ -233,7 +274,7 @@ class GunTracker:
             tboxes = [self._tracks[tid]["bbox"] for tid in tids]
             unmat  = list(range(len(dets)))
             mat    = np.zeros((len(dets), len(tids)), dtype=np.float32)
-            for di, (db, _) in enumerate(dets):
+            for di, (db, _, _c) in enumerate(dets):
                 for tj, tb in enumerate(tboxes):
                     mat[di, tj] = iou(tuple(db), tuple(tb))
             while True:
@@ -242,21 +283,21 @@ class GunTracker:
                     break
                 di, tj = fi
                 tid = tids[tj]
-                db, ds = dets[di]
-                self._tracks[tid].update(bbox=db, score=ds, lost=0)
-                result.append((tid, db, ds))
+                db, ds, dc = dets[di]
+                self._tracks[tid].update(bbox=db, score=ds, class_id=dc, lost=0)
+                result.append((tid, db, ds, dc))
                 mat[di, :] = -1
                 mat[:, tj] = -1
                 unmat.remove(di)
             for di in unmat:
-                db, ds = dets[di]
-                self._tracks[self._nid] = dict(bbox=db, score=ds, lost=0)
-                result.append((self._nid, db, ds))
+                db, ds, dc = dets[di]
+                self._tracks[self._nid] = dict(bbox=db, score=ds, class_id=dc, lost=0)
+                result.append((self._nid, db, ds, dc))
                 self._nid += 1
         else:
-            for db, ds in dets:
-                self._tracks[self._nid] = dict(bbox=db, score=ds, lost=0)
-                result.append((self._nid, db, ds))
+            for db, ds, dc in dets:
+                self._tracks[self._nid] = dict(bbox=db, score=ds, class_id=dc, lost=0)
+                result.append((self._nid, db, ds, dc))
                 self._nid += 1
 
         stale = [t for t, v in self._tracks.items() if v["lost"] > self.max_lost]
@@ -452,26 +493,27 @@ def model_fn(overrides: Optional[Dict] = None) -> Dict:
     if not gun_models:
         raise RuntimeError("No gun models loaded — check model paths.")
 
-    # ── Pose model (nano TRT) ─────────────────────────────────────────────
+    # ── Pose model (medium TRT) ──────────────────────────────────────────
     pose_path = _resolve_model_path(
         cfg["POSE_MODEL_PATH"],
-        cfg.get("POSE_MODEL_FALLBACK_PATH", "yolo11n-pose.pt"),
+        cfg.get("POSE_MODEL_FALLBACK_PATH", "yolo11m-pose.pt"),
         "pose",
         verbose,
     )
     pose_model = YOLO(pose_path)
     log("✓ Pose model loaded", verbose)
 
-    # ── OSNet ReID — disabled for performance (~35ms saved per frame)
-    # DeepSort falls back to IoU-only matching, which is sufficient for
-    # fixed-camera security feeds. Re-enable by setting USE_OSNET: True.
+    # ── OSNet ReID — selective embedding for occlusion-robust tracking ───
+    # Only crops for non-confirmed (new/re-appearing) tracks are embedded
+    # each frame. Confirmed stable tracks reuse their gallery entry, so
+    # the ~30ms OSNet cost is only paid when someone new enters or returns.
     osnet = None
-    if cfg.get("USE_OSNET", False):
+    if cfg.get("USE_OSNET", True):
         try:
             osnet = load_osnet(device)
-            log("✓ OSNet ReID", verbose)
+            log("✓ OSNet ReID (threat-only — armed persons only)", verbose)
         except Exception as e:
-            log(f"⚠ OSNet: {e}", verbose)
+            log(f"⚠ OSNet failed to load: {e}", verbose)
     else:
         log("OSNet ReID disabled (USE_OSNET=False) — IoU-only tracking", verbose)
 
@@ -480,11 +522,8 @@ def model_fn(overrides: Optional[Dict] = None) -> Dict:
         max_age=cfg["TRACKER_MAX_AGE"],
         n_init=cfg["TRACKER_N_INIT"],
         max_iou_distance=cfg["TRACKER_MAX_IOU_DISTANCE"],
-        # When OSNet is disabled pass embedder=None and set max_cosine_distance
-        # to 1.0 so DeepSort never tries to compute cosine similarity on None
-        # embeddings — it falls back to pure IoU matching.
-        max_cosine_distance=cfg["TRACKER_MAX_COSINE_DISTANCE"] if cfg.get("USE_OSNET", False) else 1.0,
-        nn_budget=cfg["TRACKER_NN_BUDGET"] if cfg.get("USE_OSNET", False) else None,
+        max_cosine_distance=cfg["TRACKER_MAX_COSINE_DISTANCE"] if osnet else 1.0,
+        nn_budget=cfg["TRACKER_NN_BUDGET"] if osnet else None,
         embedder=None,
     )
 
@@ -512,6 +551,13 @@ def model_fn(overrides: Optional[Dict] = None) -> Dict:
         "device":         device,
         "config":         cfg,
         "inference_pool": inference_pool,
+        # Persistent set of all person IDs ever confirmed as armed.
+        # Once a person goes purple they stay purple for the session.
+        "armed_ids":      set(),
+        # Maps cid → frame_number until which ReID is frozen for that person.
+        # Prevents ID-swap attempts in the frames immediately after marking,
+        # when the tracker is still stabilising around the new appearance.
+        "armed_id_locked_until": {},
     }
 
 
@@ -538,9 +584,15 @@ def _run_pose(frame: np.ndarray, pose_model, conf_thr: float):
     return boxes, scores, kpts
 
 
-def _run_gun_model(frame: np.ndarray, m: Dict, imgsz: int = 640):
-    """Worker: run one gun model and return list of (bbox, weighted_score).
-    stream=True avoids a CUDA sync stall when pose runs concurrently."""
+def _run_gun_model(frame: np.ndarray, m: Dict, imgsz: int = 640,
+                   ignored_ids: Optional[set] = None):
+    """Worker: run one gun model and return list of (bbox, weighted_score, class_id).
+
+    Filtering priority (from most to least permissive):
+      1. ignored_ids  — always skip these class IDs (Person, Tool, Fire_Smoke)
+      2. target_class_ids — if set, only keep these; None = keep all non-ignored
+    stream=True avoids a CUDA sync stall when pose runs concurrently.
+    """
     results = []
     try:
         r = m["model"].predict(frame, conf=m["conf"], verbose=False,
@@ -551,9 +603,15 @@ def _run_gun_model(frame: np.ndarray, m: Dict, imgsz: int = 640):
         boxes  = r.boxes.xyxy.cpu().numpy()
         scores = r.boxes.conf.cpu().numpy()
         cls    = r.boxes.cls.cpu().numpy().astype(int)
-        mask   = cls == m.get("target_class_id", 0)
-        for b, s in zip(boxes[mask], scores[mask]):
-            results.append((b, float(s) * m.get("weight", 1.0)))
+
+        allowed  = m.get("target_class_ids", None)   # None = all classes
+        ignored  = ignored_ids or set()
+        for b, s, c in zip(boxes, scores, cls):
+            if c in ignored:                          # filter: Person, Tool, Fire_Smoke
+                continue
+            if allowed is not None and c not in allowed:
+                continue
+            results.append((b, float(s) * m.get("weight", 1.0), int(c)))
     except Exception:
         pass
     return results
@@ -628,6 +686,8 @@ def predict_fn(input_data: Dict, model: Dict) -> Dict:
     device    = model["device"]
     cfg       = model["config"]
     pool      = model["inference_pool"]
+    armed_ids           = model["armed_ids"]          # persistent — never cleared
+    armed_id_locked_until = model["armed_id_locked_until"]  # cid → unlock frame
 
     frame        = input_data["frame"]
     cam_id       = input_data.get("cam_id", -1)
@@ -659,59 +719,115 @@ def predict_fn(input_data: Dict, model: Dict) -> Dict:
         gun_imgsz = cfg.get("GUN_INFER_IMGSZ", 480)
         run_gun   = (frame_number % gun_skip == 0)
         if run_gun:
+            ignored_ids = cfg.get("IGNORED_CLASS_IDS", {2, 5, 6})
             for i, m in enumerate(model["gun_models"]):
-                futures[f"gun_{i}"] = pool.submit(_run_gun_model, infer_frame, m, gun_imgsz)
+                futures[f"gun_{i}"] = pool.submit(_run_gun_model, infer_frame, m, gun_imgsz, ignored_ids)
 
         # ── Collect pose results and unscale to original coords ───────────
         p_boxes_lb, p_scores, kpts_lb = futures["pose"].result()
         p_boxes = _unscale_boxes(p_boxes_lb, lb_scale, lb_pad)
         kpts    = _unscale_kpts(kpts_lb, lb_scale, lb_pad)
 
-        # ── Build crop list from pose boxes ──────────────────────────────
+        # ── Build detection list + threat-only OSNet embeddings ──────────
+        # Rules:
+        #   1. Unarmed persons — always None (IoU-only, zero OSNet cost).
+        #   2. Armed persons within REID_LOCK_FRAMES of being marked — None.
+        #      The lock prevents ID-swap attempts while the tracker is still
+        #      settling; the existing gallery entry is reused automatically.
+        #   3. Armed persons past their lock expiry — embed every frame so
+        #      the gallery stays fresh for occlusion recovery.
+
+        reid_lock = cfg.get("REID_LOCK_FRAMES", 60)
+
+        # Collect (cid, bbox) for armed tracks whose lock has expired.
+        # These are the only detections that will receive an OSNet embedding.
+        embeddable_armed: List[Tuple[int, np.ndarray]] = []
+        for t in tracker.tracker.tracks:
+            if not t.is_confirmed():
+                continue
+            try:
+                cid = id_mapper.get(int(t.track_id))
+                if cid not in armed_ids:
+                    continue
+                locked_until = armed_id_locked_until.get(cid, 0)
+                if frame_number < locked_until:
+                    continue   # still inside the post-marking cooldown
+                ltrb = t.to_tlbr()
+                embeddable_armed.append((cid, np.array(ltrb, dtype=np.float32)))
+            except Exception:
+                pass
+
         ds_dets = []
-        crops   = []
+        crops_to_embed: List[Optional[np.ndarray]] = []
+
         for b, s in zip(p_boxes, p_scores):
             x1, y1, x2, y2 = map(int, b)
             if (x2-x1)*(y2-y1) < cfg["MIN_PERSON_AREA"]:
                 continue
             ds_dets.append(([x1, y1, x2-x1, y2-y1], float(s), "person"))
-            if osnet:
-                crop = frame[max(0,y1):max(0,y2), max(0,x1):max(0,x2)]
-                crops.append(crop)
 
-        # ── Submit OSNet as a future — overlaps with gun result collection ─
-        # While we wait for the gun model below, OSNet runs concurrently.
-        if osnet and crops:
-            futures["osnet"] = pool.submit(_osnet_encode_batch, osnet, crops, device)
+            if osnet and embeddable_armed:
+                # Embed if this detection overlaps an embeddable armed track
+                # (IoU > 0.35 tolerates moderate positional drift between frames)
+                det_box = np.array([x1, y1, x2, y2], dtype=np.float32)
+                is_embeddable = any(
+                    iou(tuple(det_box), tuple(ab)) > 0.35
+                    for _cid, ab in embeddable_armed
+                )
+                if is_embeddable:
+                    crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                    crops_to_embed.append(crop if crop.size > 0 else None)
+                else:
+                    crops_to_embed.append(None)
+            else:
+                # Unarmed, or armed but still inside lock period
+                crops_to_embed.append(None)
+
+        # ── Submit OSNet only for unlocked armed-person crops ─────────────
+        valid_crops = [c for c in crops_to_embed if c is not None]
+        if osnet and valid_crops:
+            futures["osnet"] = pool.submit(_osnet_encode_batch, osnet, valid_crops, device)
 
         # ── Collect gun results (propagate on skipped frames) ────────────
         if run_gun:
-            raw_preds: List[Tuple[np.ndarray, float]] = []
+            raw_preds: List[Tuple[np.ndarray, float, int]] = []
             for i in range(len(model["gun_models"])):
                 raw_preds.extend(futures[f"gun_{i}"].result())
             # Unscale gun boxes from letterbox coords back to original frame coords
-            raw_preds = [(_unscale_boxes(b[np.newaxis], lb_scale, lb_pad)[0], s)
-                         for b, s in raw_preds]
+            raw_preds = [(_unscale_boxes(b[np.newaxis], lb_scale, lb_pad)[0], s, c)
+                         for b, s, c in raw_preds]
         else:
             raw_preds = [
-                (np.array(v["bbox"]), v["score"])
+                (np.array(v["bbox"]), v["score"], v.get("class_id", 0))
                 for v in model["gun_tracker"]._tracks.values()
                 if v["lost"] == 0
             ]
 
-        # ── Collect OSNet embeddings (likely already done by now) ─────────
-        # When OSNet is disabled, pass unit-vectors so DeepSort's cosine
-        # metric always receives valid normalised 2D arrays (no NaN/divide).
-        # nn_budget=None ensures no gallery is built, so cosine distance
-        # is never actually used for matching — IoU dominates.
+        # ── Collect OSNet embeddings and build final embeds list ─────────
+        # Skipped crops (confirmed stable tracks) get a unit-vector placeholder
+        # so DeepSort's cosine path always receives a valid 2D array.
+        # The gallery entry for those tracks dominates — the placeholder is
+        # never stored because the detection is matched before gallery update.
         _EMBED_DIM = 512
+        _unit = np.ones(_EMBED_DIM, dtype=np.float32) / np.sqrt(_EMBED_DIM)
+
         if osnet:
-            embeds = [None] * len(ds_dets)
+            batch_results: List[Optional[np.ndarray]] = []
             if "osnet" in futures:
-                embeds = futures["osnet"].result()
+                batch_results = futures["osnet"].result()
+
+            embed_list: List[np.ndarray] = []
+            bi = 0
+            for c in crops_to_embed:
+                if c is not None:
+                    feat = batch_results[bi] if bi < len(batch_results) else None
+                    embed_list.append(feat if feat is not None else _unit.copy())
+                    bi += 1
+                else:
+                    embed_list.append(_unit.copy())
+            embeds = embed_list
         else:
-            unit = np.ones(_EMBED_DIM, dtype=np.float32) / np.sqrt(_EMBED_DIM)
-            embeds = [unit.copy() for _ in ds_dets]
+            embeds = [_unit.copy() for _ in ds_dets]
 
         tracks = tracker.update_tracks(ds_dets, embeds=embeds, frame=frame)
 
@@ -744,20 +860,22 @@ def predict_fn(input_data: Dict, model: Dict) -> Dict:
 
         kpts_list = [kpts_map.get(p[4]) for p in persons]
 
-        # Agreement bonus across models
-        fused: List[Tuple[np.ndarray, float]] = []
-        for i, (b, s) in enumerate(raw_preds):
+        # Agreement bonus across models (same class only)
+        fused: List[Tuple[np.ndarray, float, int]] = []
+        for i, (b, s, c) in enumerate(raw_preds):
             agreements = sum(
                 iou(tuple(b), tuple(raw_preds[j][0])) > cfg["WBF_IOU_THR"]
+                and raw_preds[j][2] == c
                 for j in range(len(raw_preds)) if j != i
             )
             bonus = cfg["AGREEMENT_BONUS"] if agreements >= 1 else 0
-            fused.append((b, min(1.0, s + bonus)))
+            fused.append((b, min(1.0, s + bonus), c))
 
-        # NMS
+        # NMS — suppress overlapping boxes of the same class
         if fused:
             all_b = [f[0] for f in fused]
             all_s = [f[1] for f in fused]
+            all_c = [f[2] for f in fused]
             order = np.argsort(all_s)[::-1]
             used  = set()
             kept  = []
@@ -767,80 +885,155 @@ def predict_fn(input_data: Dict, model: Dict) -> Dict:
                 kept.append(i)
                 for j in order:
                     if j != i and j not in used:
-                        if iou(tuple(all_b[i]), tuple(all_b[j])) >= 0.40:
+                        if (all_c[i] == all_c[j] and
+                                iou(tuple(all_b[i]), tuple(all_b[j])) >= 0.40):
                             used.add(j)
                 used.add(i)
             fused = [fused[i] for i in kept]
 
-        # ── Size filter + confidence threshold (no non-weapon verifier) ───
-        verified: List[Tuple[np.ndarray, float]] = []
-        for b, s in fused:
+        # ── Size filter + confidence threshold ────────────────────────────
+        verified: List[Tuple[np.ndarray, float, int]] = []
+        for b, s, c in fused:
             if s < cfg["FINAL_CONFIDENCE_THRESHOLD"]:
                 continue
             if not valid_gun_box(b, cfg, frame.shape):
                 continue
-            verified.append((b, s))
+            verified.append((b, s, c))
 
         # ── Gun tracker ───────────────────────────────────────────────────
         tracked_guns = gun_trk.update(verified)
 
         # ── Holder association ────────────────────────────────────────────
+        weapon_names   = cfg.get("WEAPON_CLASS_NAMES", {})
+        firearm_ids    = cfg.get("FIREARM_CLASS_IDS", None)   # None = all trigger armed
+        melee_ids      = cfg.get("MELEE_CLASS_IDS", set())
+        MELEE_COLOR    = (0, 165, 255)  # ORANGE — melee weapon box
+
         gun_dets:       List[Dict]      = []
         active_holders: Dict[int, Dict] = {}
         new_alerts = 0
 
-        for gun_id, gun_bbox, gun_score in tracked_guns:
+        for gun_id, gun_bbox, gun_score, gun_class_id in tracked_guns:
             if gun_score < cfg["FINAL_CONFIDENCE_THRESHOLD"]:
                 continue
+
+            weapon_name = weapon_names.get(gun_class_id, f"Weapon-{gun_class_id}")
+            is_firearm  = (firearm_ids is None) or (gun_class_id in firearm_ids)
+            is_melee    = gun_class_id in melee_ids
 
             holder_id = associate_holder(gun_bbox, persons, kpts_list, cfg)
             if holder_id is None:
                 continue
 
             gun_dets.append({
-                "gun_id":    gun_id,
-                "bbox":      gun_bbox.tolist(),
-                "score":     round(gun_score, 3),
-                "holder_id": holder_id,
+                "gun_id":      gun_id,
+                "bbox":        gun_bbox.tolist(),
+                "score":       round(gun_score, 3),
+                "holder_id":   holder_id,
+                "class_id":    gun_class_id,
+                "weapon_type": weapon_name,
             })
 
-            prev = active_holders.get(holder_id)
-            if prev is None or gun_score > prev["conf"]:
-                for person in persons:
-                    l, t_, r, b_, pid = person
-                    if pid == holder_id:
-                        active_holders[holder_id] = {
-                            "bbox": [l, t_, r, b_],
-                            "conf": gun_score,
-                        }
-                        break
+            if is_firearm:
+                prev = active_holders.get(holder_id)
+                if prev is None or gun_score > prev["conf"]:
+                    for person in persons:
+                        l, t_, r, b_, pid = person
+                        if pid == holder_id:
+                            active_holders[holder_id] = {
+                                "bbox":        [l, t_, r, b_],
+                                "conf":        gun_score,
+                                "weapon_type": weapon_name,
+                            }
+                            break
+
+                # Permanently mark as armed (firearms only — not melee).
+                # Reset the ReID lock on every detection event for this person,
+                # not just the first — if they raise the gun again later the
+                # lock window slides forward to prevent ID swaps each time.
+                unlock_at = frame_number + cfg.get("REID_LOCK_FRAMES", 60)
+                armed_id_locked_until[holder_id] = unlock_at
+                armed_ids.add(holder_id)
 
             if alerts.check(holder_id, gun_score):
                 new_alerts += 1
 
         # ── Draw ──────────────────────────────────────────────────────────
         out = frame.copy()
+        PERSON_COLOR = (0, 200, 0)   # GREEN — tracked, never armed
 
-        for pid, info in active_holders.items():
-            l, t_, r, b_ = info["bbox"]
+        person_bbox: Dict[int, List[int]] = {p[4]: p[:4] for p in persons}
+
+        # All person IDs that must NOT get a green box this frame:
+        #   - permanently armed (ever held a firearm — in armed_ids)
+        #   - current frame weapon holders (active_holders covers melee too)
+        no_green: set = armed_ids | set(active_holders.keys())
+
+        # Green box for unarmed tracked persons — no ID label, no box
+        # if they have ever been or are currently holding any weapon
+        for person in persons:
+            l, t_, r, b_, pid = person
+            if pid in no_green:
+                continue
+            cv2.rectangle(out, (int(l), int(t_)), (int(r), int(b_)),
+                          PERSON_COLOR, 2)
+
+        # Purple box for all threat persons visible this frame.
+        # Two cases:
+        #   A) Persons in armed_ids (permanently marked — firearm confirmed).
+        #      Show last-known weapon info from active_holders if still armed
+        #      this frame, otherwise just show "Armed" with the stored conf.
+        #   B) Current-frame melee holders who are NOT yet in armed_ids —
+        #      they are in active_holders but not permanently flagged.
+        drawn_purple: set = set()
+
+        # Case A — permanently armed
+        for pid in armed_ids:
+            if pid not in person_bbox:
+                continue
+            l, t_, r, b_ = person_bbox[pid]
+            holder_info  = active_holders.get(pid, {})
+            conf         = holder_info.get("conf", cfg.get("ALERT_THRESHOLD", 0.45))
+            wtype        = holder_info.get("weapon_type", "Armed")
             cv2.rectangle(out, (int(l), int(t_)), (int(r), int(b_)),
                           HOLDER_COLOR, 3)
             cv2.putText(out,
-                        f"ID:{pid} [ARMED] ({info['conf']:.2f})",
-                        (min(int(l), w-200), max(0, int(t_)-8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, HOLDER_COLOR, 2)
+                        f"ID:{pid} [{wtype}] ({conf:.2f})",
+                        (min(int(l), w-220), max(0, int(t_)-8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, HOLDER_COLOR, 2)
+            drawn_purple.add(pid)
 
+        # Case B — melee / current-frame holders not yet in armed_ids
+        for pid, info in active_holders.items():
+            if pid in drawn_purple:
+                continue
+            if pid not in person_bbox:
+                continue
+            l, t_, r, b_ = person_bbox[pid]
+            conf  = info.get("conf", cfg.get("ALERT_THRESHOLD", 0.45))
+            wtype = info.get("weapon_type", "Weapon")
+            cv2.rectangle(out, (int(l), int(t_)), (int(r), int(b_)),
+                          HOLDER_COLOR, 3)
+            cv2.putText(out,
+                        f"ID:{pid} [{wtype}] ({conf:.2f})",
+                        (min(int(l), w-220), max(0, int(t_)-8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, HOLDER_COLOR, 2)
+
+        # Weapon boxes — colour by type, label with weapon name + class score
+        melee_ids_cfg = cfg.get("MELEE_CLASS_IDS", set())
         for g in gun_dets:
             x1, y1, x2, y2 = map(int, g["bbox"])
-            label = f"G{g['gun_id']} {g['score']:.2f}"
-            cv2.rectangle(out, (x1, y1), (x2, y2), GUN_COLOR, 2)
-            (tw, th), _ = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 2)
-            ly = max(0, y1-6)
-            cv2.rectangle(out, (x1, ly-th-2), (x1+tw+2, ly+2), GUN_COLOR, -1)
-            cv2.putText(out, label, (x1, ly),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2)
+            wname  = g["weapon_type"]
+            label  = f"{wname} {g['score']:.2f}"
+            color  = MELEE_COLOR if g["class_id"] in melee_ids_cfg else GUN_COLOR
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            ly = max(0, y1 - 6)
+            cv2.rectangle(out, (x1, ly-th-2), (x1+tw+4, ly+2), color, -1)
+            cv2.putText(out, label, (x1+2, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
+        # Alert banner
         if new_alerts > 0:
             cv2.rectangle(out, (0, 0), (w, 44), ALERT_COLOR, -1)
             cv2.putText(out,
@@ -917,22 +1110,31 @@ def output_frame_fn(prediction: Dict) -> Dict:
     guns = prediction.get("guns", [])
 
     gun_holders = [
-        {"track_id": g["holder_id"], "confidence": g["score"]}
+        {
+            "track_id":   g["holder_id"],
+            "confidence": g["score"],
+            "weapon_type": g.get("weapon_type", "Unknown"),
+            "class_id":   g.get("class_id", 0),
+        }
         for g in guns
     ]
 
     alerts = []
     if prediction.get("new_alerts", 0) > 0:
         for pid in prediction.get("active_holders", []):
-            conf = next(
-                (g["score"] for g in guns if g["holder_id"] == pid), 0.0
+            matched = next(
+                (g for g in guns if g["holder_id"] == pid), {}
             )
+            conf  = matched.get("score", 0.0)
+            wtype = matched.get("weapon_type", "Unknown")
             level = "CRITICAL" if conf >= 0.85 else "HIGH"
             alerts.append({
-                "track_id":   pid,
-                "confidence": conf,
-                "level":      level,
-                "timestamp":  prediction.get("timestamp", ""),
+                "track_id":    pid,
+                "confidence":  conf,
+                "level":       level,
+                "weapon_type": wtype,
+                "class_id":    matched.get("class_id", 0),
+                "timestamp":   prediction.get("timestamp", ""),
             })
 
     return {
