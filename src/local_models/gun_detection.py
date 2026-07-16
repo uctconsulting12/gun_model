@@ -45,17 +45,17 @@ CONFIG_OVERRIDES = {
     "ALERT_ON_FIRST_DETECTION_ONLY": True,  # Only alert once per person
     "ALERT_COOLDOWN_FRAMES": 90,            # 3 seconds @ 30fps (if not first-only)
 
-    # Detection thresholds
+    # Detection thresholds — lowered for better recall on multiple people
     "CRITICAL_THRESHOLD": 0.85,             # Red/Critical alerts
-    "HIGH_THRESHOLD": 0.65,                 # Orange/High alerts
-    "FINAL_CONFIDENCE_THRESHOLD": 0.65,
+    "HIGH_THRESHOLD": 0.55,                 # Orange/High alerts
+    "FINAL_CONFIDENCE_THRESHOLD": 0.40,     # Min score for a gun det to be reported
 
-    # Model confidence
-    "CONF_THR_POSE": 0.25,
-    "CONF_THR_WRIST": 0.20,
+    # Model confidence — lower to catch more detections
+    "CONF_THR_POSE": 0.20,                  # Person detection threshold
+    "CONF_THR_WRIST": 0.15,                 # Wrist keypoint threshold for holder assoc
 
-    # Parallel inference workers (pose + gun run concurrently, OSNet disabled)
-    "INFERENCE_WORKERS": 2,
+    # Parallel inference workers (pose + gun + OSNet run concurrently)
+    "INFERENCE_WORKERS": 3,
 
     # Gun model frame-skip: 1 = disabled (every frame)
     "GUN_SKIP_FRAMES": 1,
@@ -63,8 +63,11 @@ CONFIG_OVERRIDES = {
     # Gun inference input size (480 = ~30% faster than 640, dynamic engine)
     "GUN_INFER_IMGSZ": 480,
 
-    # OSNet ReID disabled — saves ~35ms/frame, IoU-only DeepSort tracking
-    "USE_OSNET": False,
+    # OSNet ReID enabled — threat-only embedding.
+    # Only persons already in armed_ids (confirmed gun holders) get their
+    # crop embedded each frame; everyone else uses IoU-only matching.
+    # Cost drops to ~1 OSNet call per armed person instead of per all persons.
+    "USE_OSNET": True,
 }
 
 # ===================== PER-CAMERA TRACKING MANAGER =====================
@@ -107,10 +110,11 @@ class CameraTracker:
             if cam_id in self.cameras:
                 camera_state = self.cameras[cam_id]
                 model = camera_state["model"]
-                # Reset alert manager and gun tracker (correct model dict keys)
                 model["alerts"].reset()
                 model["gun_tracker"].reset()
                 model["id_mapper"].reset()
+                model["armed_ids"].clear()
+                model["armed_id_locked_until"].clear()
                 camera_state["frame_counter"] = 0
                 print(f"[CameraTracker] ✓ Reset tracking for camera {cam_id}")
     
@@ -422,7 +426,7 @@ def test_inference(video_path: str, cam_id: int = 1):
 # ===================== MAIN =====================
 if __name__ == "__main__":
     # Test the inference function
-    VIDEO_PATH = r"video6.mp4"
+    VIDEO_PATH = r"videos/video2.mp4"
     
     print("\n🧪 TESTING MODE")
     print("This simulates how your websocket calls run_inference()\n")

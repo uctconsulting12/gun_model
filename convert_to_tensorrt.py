@@ -7,8 +7,17 @@ Usage:
     python convert_to_tensorrt.py
 
 Outputs (in project root):
-    best.engine           — gun detection TensorRT engine (YOLOv8n fine-tune)
-    yolo11n-pose.engine   — pose estimation TensorRT engine
+    best.engine              — weapon detection TensorRT engine (YOLO26x, 7 classes)
+    yolo11m-pose.engine      — pose estimation TensorRT engine (YOLO11m)
+
+Model classes (best.pt / best.engine):
+    0: Blunt_Weapon
+    1: Explosive
+    2: Fire_Smoke   ← filtered out at inference (IGNORED_CLASS_IDS)
+    3: Firearm
+    4: Melee_Weapon
+    5: Person       ← filtered out at inference (handled by pose model)
+    6: Tool         ← filtered out at inference (not a threat)
 
 Requirements:
     - NVIDIA GPU with CUDA
@@ -19,6 +28,8 @@ Notes:
     - FP16 is used by default (2x faster than FP32, negligible accuracy loss)
     - dynamic=True lets you tune GUN_INFER_IMGSZ at runtime (e.g. 480 for speed)
     - The engine is device-specific — regenerate if you change GPU
+    - YOLO26x is a large model (~118MB); build time can take 5-10 minutes
+    - If workspace=4 fails with memory errors, reduce to workspace=2 or workspace=1
 """
 
 import os
@@ -28,7 +39,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def convert(model_path: str, output_name: str, imgsz: int = 640, half: bool = True,
-            dynamic: bool = False):
+            dynamic: bool = False, workspace: int = 4):
     """Export a YOLO .pt model to a TensorRT .engine file."""
     from ultralytics import YOLO
     import torch
@@ -48,20 +59,41 @@ def convert(model_path: str, output_name: str, imgsz: int = 640, half: bool = Tr
         return engine_path
 
     print(f"\n[EXPORT] {model_path} → {output_name}")
-    print(f"         imgsz={imgsz}, half={half}, dynamic={dynamic}")
+    print(f"         imgsz={imgsz}, half={half}, dynamic={dynamic}, workspace={workspace}GB")
 
     model = YOLO(abs_path)
-    exported = model.export(
-        format="engine",
-        imgsz=imgsz,
-        half=half,          # FP16 — fastest on modern GPUs
-        dynamic=dynamic,    # dynamic=True allows variable input sizes at runtime
-        device=0,           # GPU 0
-        workspace=4,        # GB of TRT workspace
-        verbose=False,
-    )
-    print(f"[OK]   Exported → {exported}")
-    return exported
+    try:
+        exported = model.export(
+            format="engine",
+            imgsz=imgsz,
+            half=half,          # FP16 — fastest on modern GPUs
+            dynamic=dynamic,    # dynamic=True allows variable input sizes at runtime
+            device=0,           # GPU 0
+            workspace=workspace,
+            verbose=False,
+        )
+        print(f"[OK]   Exported → {exported}")
+        return exported
+    except RuntimeError as e:
+        if "workspace" in str(e).lower() or "memory" in str(e).lower():
+            print(f"[WARN] Build failed with workspace={workspace}GB. Retrying with workspace=2GB...")
+            try:
+                exported = model.export(
+                    format="engine",
+                    imgsz=imgsz,
+                    half=half,
+                    dynamic=dynamic,
+                    device=0,
+                    workspace=2,
+                    verbose=False,
+                )
+                print(f"[OK]   Exported → {exported}")
+                return exported
+            except RuntimeError as e2:
+                print(f"[ERROR] Export failed at workspace=2GB too: {e2}")
+                print("        Try workspace=1 manually or use the .pt fallback.")
+                return None
+        raise
 
 
 if __name__ == "__main__":
@@ -69,14 +101,17 @@ if __name__ == "__main__":
     print("  YOLO -> TensorRT Conversion")
     print("=" * 60)
 
-    # 1. Gun detection model — dynamic shapes so we can run at 416/480 for speed
-    convert("best.pt", "best.engine", imgsz=640, half=True, dynamic=True)
+    # 1. Weapon detection model — YOLO26x (7 classes), dynamic shapes
+    #    Firearm/Explosive/Blunt/Melee will raise alerts; Person/Tool/Fire_Smoke
+    #    are filtered at inference time via IGNORED_CLASS_IDS.
+    convert("best.pt", "best.engine", imgsz=640, half=True, dynamic=True, workspace=4)
 
-    # 2. Pose model — nano variant (fastest), dynamic shapes
-    convert("yolo11n-pose.pt", "yolo11n-pose.engine", imgsz=640, half=True, dynamic=True)
+    # 2. Pose model — YOLO11m for better keypoint accuracy, dynamic shapes
+    #    ultralytics will auto-download yolo11m-pose.pt if not present
+    convert("yolo11m-pose.pt", "yolo11m-pose.engine", imgsz=640, half=True, dynamic=True, workspace=4)
 
     print("\n[DONE] All conversions complete.")
-    print("       Start the server — it will load .engine files automatically.")
+    print("       Start the server - it will load .engine files automatically.")
     print()
     print("  TIP: engines exported with dynamic=True support variable input sizes.")
     print("       Set GUN_INFER_IMGSZ=480 in CONFIG_OVERRIDES for ~30% faster gun inference.")

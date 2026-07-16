@@ -28,12 +28,8 @@ output_annotated4.mp4
 output_annotated5.mp4
 output/
 
-# TensorRT engine files (large, GPU-specific — regenerate with convert_to_tensorrt.py)
 *.engine
-yolo11n-pose.pt
-non_weapons.pt
-gunn2.pt
-gunn2.engine
-best.onnx
-best.engine
-*.mp4
+*.onnx
+*.pt
+videos/
+dataset/

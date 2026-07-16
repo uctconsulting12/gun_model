@@ -10,8 +10,11 @@ Usage:
     # Terminal 2 — run this test
     .venv\\Scripts\\python test_websocket.py
 
+    # With live OpenCV display window
+    .venv\\Scripts\\python test_websocket.py --show
+
     # Optional overrides
-    .venv\\Scripts\\python test_websocket.py --url rtsp://... --host localhost --port 8004
+    .venv\\Scripts\\python test_websocket.py --url rtsp://... --host localhost --port 8004 --show
 """
 
 import asyncio
@@ -21,12 +24,20 @@ import argparse
 import statistics
 import os
 import sys
+import base64
 
 try:
     import websockets
 except ImportError:
     print("[ERROR] websockets not installed. Run: pip install websockets")
     sys.exit(1)
+
+try:
+    import cv2
+    import numpy as np
+    _CV2_AVAILABLE = True
+except ImportError:
+    _CV2_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Defaults
@@ -40,6 +51,30 @@ DEFAULT_ORG_ID    = 1
 DEFAULT_USER_ID   = 1
 TARGET_FPS        = 15.0
 
+WINDOW_NAME = "Gun Detection — Live"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OpenCV display helper
+# ─────────────────────────────────────────────────────────────────────────────
+def _show_frame(b64_str: str, window_name: str) -> bool:
+    """
+    Decode a base64 JPEG string and display it in a named OpenCV window.
+    Returns False if the user pressed 'q' (quit signal).
+    """
+    if not b64_str or not _CV2_AVAILABLE:
+        return True
+    try:
+        arr = np.frombuffer(base64.b64decode(b64_str), dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return True
+        cv2.imshow(window_name, img)
+        key = cv2.waitKey(1) & 0xFF
+        return key != ord("q")
+    except Exception:
+        return True
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Test client
@@ -47,7 +82,8 @@ TARGET_FPS        = 15.0
 async def run_test(host: str, port: int, video_url: str,
                    client_id: str, camera_id: int,
                    org_id: int, user_id: int,
-                   max_frames: int = 0) -> None:
+                   max_frames: int = 0,
+                   show: bool = False) -> None:
 
     uri = f"ws://{host}:{port}/ws/gundetection/{client_id}"
     print("=" * 70)
@@ -57,6 +93,11 @@ async def run_test(host: str, port: int, video_url: str,
     print(f"  Stream    : {video_url}")
     print(f"  Camera ID : {camera_id}")
     print(f"  Max frames: {'all' if max_frames == 0 else max_frames}")
+    if show:
+        if _CV2_AVAILABLE:
+            print(f"  Display   : OpenCV window  (press 'q' to quit)")
+        else:
+            print(f"  Display   : DISABLED — opencv-python not installed")
     print()
 
     try:
@@ -151,6 +192,14 @@ async def run_test(host: str, port: int, video_url: str,
                           f"persons={stats.get('persons_tracked', 0)}",
                           end="", flush=True)
 
+                    # ── OpenCV display ────────────────────────────────────
+                    if show:
+                        b64 = det.get("annotated_frame", "")
+                        keep_going = _show_frame(b64, WINDOW_NAME)
+                        if not keep_going:
+                            print("\n\n  [INFO] Display window closed by user ('q').")
+                            break
+
                     if max_frames and frame_count >= max_frames:
                         print(f"\n\n  [INFO] Reached max_frames={max_frames}, stopping.")
                         break
@@ -166,6 +215,10 @@ async def run_test(host: str, port: int, video_url: str,
                 print("  [>>] Sent stop_stream")
             except Exception:
                 pass
+
+            # ── Cleanup display window ────────────────────────────────────
+            if show and _CV2_AVAILABLE:
+                cv2.destroyAllWindows()
 
             # ── Report ────────────────────────────────────────────────────
             wall = time.perf_counter() - t_start
@@ -229,6 +282,8 @@ def main():
     parser.add_argument("--user-id",    default=DEFAULT_USER_ID,   type=int)
     parser.add_argument("--max-frames", default=0, type=int,
                         help="Stop after N frames (0 = run to end)")
+    parser.add_argument("--show", action="store_true",
+                        help="Show annotated output in an OpenCV window")
     args = parser.parse_args()
 
     asyncio.run(run_test(
@@ -240,6 +295,7 @@ def main():
         org_id     = args.org_id,
         user_id    = args.user_id,
         max_frames = args.max_frames,
+        show       = args.show,
     ))
 
 
